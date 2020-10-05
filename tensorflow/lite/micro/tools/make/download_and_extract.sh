@@ -114,6 +114,77 @@ patch_cmsis() {
     -iname '*.*' -exec \
     sed -i -E $'s@#include "arm_nn_tables.h"@#include "cmsis/CMSIS/NN/Include/arm_nn_tables.h"@g' {} \;
 
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "arm_math_types.h"@#include "cmsis/CMSIS/DSP/Include/arm_math_types.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "arm_math_memory.h"@#include "cmsis/CMSIS/DSP/Include/arm_math_memory.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/none.h"@#include "cmsis/CMSIS/DSP/Include/dsp/none.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/utils.h"@#include "cmsis/CMSIS/DSP/Include/dsp/utils.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/basic_math_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/basic_math_functions.h"@g' {} \;
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/statistics_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/statistics_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/svm_defines.h"@#include "cmsis/CMSIS/DSP/Include/dsp/svm_defines.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/svm_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/svm_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/support_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/support_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/transform_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/transform_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/bayes_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/bayes_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/complex_math_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/complex_math_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/controller_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/controller_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/distance_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/distance_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/fast_math_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/fast_math_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/filtering_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/filtering_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/interpolation_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/interpolation_functions.h"@g' {} \;
+
+  find tensorflow/lite/micro/tools/make/downloads/cmsis \
+    -iname '*.*' -exec \
+    sed -i -E $'s@#include "dsp/matrix_functions.h"@#include "cmsis/CMSIS/DSP/Include/dsp/matrix_functions.h"@g' {} \;
+
   # Until the fix for https://github.com/ARMmbed/mbed-os/issues/12568 is
   # rolled into Mbed version used on the Arduino IDE, we have to replace
   # one intrinsic with a patched equivalent.
@@ -171,12 +242,20 @@ download_and_extract() {
   # loop to attempt to recover from them.
   for (( i=1; i<=$curl_retries; ++i ))
   do
+    # We have to use this approach because we normally halt the script when
+    # there's an error, and instead we want to catch errors so we can retry.
+    set +e
     curl -Ls --fail --retry 5 "${url}" > ${tempfile}
     CURL_RESULT=$?
+    set -e
+
+    # Was the command successful? If so, continue.
     if [[ $CURL_RESULT -eq 0 ]]
     then
       break
     fi
+
+    # Keep trying if we see the '56' error code.
     if [[ ( $CURL_RESULT -ne 56 ) || ( $i -eq $curl_retries ) ]]
     then
       echo "Error $CURL_RESULT downloading '${url}'"

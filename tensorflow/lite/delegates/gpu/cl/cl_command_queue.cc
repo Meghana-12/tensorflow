@@ -216,16 +216,14 @@ absl::Status ProfilingCommandQueue::GetBestWorkGroupIndex(
     const CLKernel& kernel, const DeviceInfo& device_info, const int3& grid,
     const std::vector<int3>& work_group_sizes, int* index) {
   // Some Adreno 3xx can have wrong numbers for some events
-  const bool possible_bug_with_events =
-      device_info.vendor == Vendor::QUALCOMM &&
-      device_info.adreno_info.gpu_version < 400;
+  const bool possible_bug_with_events = device_info.IsAdreno3xx();
   events_.resize(work_group_sizes.size());
   for (int i = 0; i < work_group_sizes.size(); ++i) {
     RETURN_IF_ERROR(CLCommandQueue::DispatchImplicit(
         kernel, grid, work_group_sizes[i], &events_[i]));
 
     // reducing the speed of memory leak on Mali for some kernels
-    if (device_info.vendor == Vendor::MALI && i % 8 == 7) {
+    if (device_info.IsMali() && i % 8 == 7) {
       events_[i - 7].Wait();
     }
     if (possible_bug_with_events) {
@@ -237,7 +235,7 @@ absl::Status ProfilingCommandQueue::GetBestWorkGroupIndex(
   RETURN_IF_ERROR(WaitForCompletion());
 
   // To release memory of some kernel pool on Mali.
-  if (device_info.vendor == Vendor::MALI) {
+  if (device_info.IsMali()) {
     RETURN_IF_ERROR(kernel.ReInit());
   }
 
@@ -332,24 +330,34 @@ absl::Duration ProfilingInfo::GetTotalTime() const {
 
 std::string ProfilingInfo::GetDetailedReport() const {
   std::string result;
-  std::map<std::string, double> timing;
+  struct OpStatistic {
+    int count;
+    double total_time;
+  };
+  std::map<std::string, OpStatistic> statistics;
   result +=
       "Per kernel timing(" + std::to_string(dispatches.size()) + " kernels):\n";
   for (const auto& dispatch : dispatches) {
     result += "  " + dispatch.label + " - " +
               std::to_string(absl::ToDoubleMilliseconds(dispatch.duration)) +
-              "ms\n";
+              " ms\n";
     auto name = dispatch.label.substr(0, dispatch.label.find(" "));
-    if (timing.find(name) != timing.end()) {
-      timing[name] += absl::ToDoubleMilliseconds(dispatch.duration);
+    if (statistics.find(name) != statistics.end()) {
+      statistics[name].count++;
+      statistics[name].total_time +=
+          absl::ToDoubleMilliseconds(dispatch.duration);
     } else {
-      timing[name] = absl::ToDoubleMilliseconds(dispatch.duration);
+      statistics[name].count = 1;
+      statistics[name].total_time =
+          absl::ToDoubleMilliseconds(dispatch.duration);
     }
   }
   result += "--------------------\n";
   result += "Accumulated time per operation type:\n";
-  for (auto& t : timing) {
-    result += "  " + t.first + " - " + std::to_string(t.second) + "ms\n";
+  for (auto& t : statistics) {
+    auto stat = t.second;
+    result += "  " + t.first + "(x" + std::to_string(stat.count) + ") - " +
+              std::to_string(stat.total_time) + " ms\n";
   }
   result += "--------------------\n";
   result += "Ideal total time: " +

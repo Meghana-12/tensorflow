@@ -67,22 +67,13 @@ def copy_handle_data(source_t, target_t):
         and handle_data.is_set
         and handle_data.shape_and_type):
       # pylint: disable=protected-access
+      if isinstance(target_t, ops.EagerTensor):
+        target_t._handle_data = handle_data
+        return
       pywrap_tf_session.SetHandleShapeAndType(target_t.graph._c_graph,
                                               target_t._as_tf_output(),
                                               handle_data.SerializeToString())
       # pylint: enable=protected-access
-      # Ensure that shapes and dtypes are propagated.
-      shapes, types = zip(*[(pair.shape, pair.dtype)
-                            for pair in handle_data.shape_and_type])
-      ranks = [len(s.dim) if not s.unknown_rank else -1 for s in shapes]
-      shapes = [[d.size for d in s.dim]  # pylint: disable=g-complex-comprehension
-                if not s.unknown_rank else None for s in shapes]
-      pywrap_tf_session.TF_GraphSetOutputHandleShapesAndTypes_wrapper(
-          target_t._op._graph._c_graph,  # pylint: disable=protected-access
-          target_t._as_tf_output(),  # pylint: disable=protected-access
-          shapes,
-          ranks,
-          types)
 
 
 @tf_export("custom_gradient")
@@ -124,6 +115,42 @@ def custom_gradient(f=None):
 
   With this definition, the gradient at x=100 will be correctly evaluated as
   1.0.
+
+  The variable `dy` is defined as the upstream gradient. i.e. the gradient from
+  all the layers or functions originating from this layer.
+
+  By chain rule we know that
+  `dy/dx = dy/x_0 * dx_0/dx_1 * ... * dx_i/dx_i+1 * ... * dx_n/dx`
+
+  In this case the gradient of our current function defined as 
+  `dx_i/dx_i+1 = (1 - 1 / (1 + e))`. The upstream gradient `dy` would be
+  `dx_i+1/dx_i+2 * dx_i+2/dx_i+3 * ... * dx_n/dx`. The upstream gradient 
+  multiplied by the current gradient is then passed downstream.
+
+  In case the function takes multiple variables as input, the `grad` 
+  function must also return  the same number of variables.
+  We take the function `z = x * y` as an example.
+
+  >>> @tf.custom_gradient
+  ... def bar(x, y):
+  ...   def grad(upstream):
+  ...     dz_dx = y
+  ...     dz_dy = x
+  ...     return upstream * dz_dx, upstream * dz_dy
+  ...   z = x * y
+  ...   return z, grad
+  >>> x = tf.constant(2.0, dtype=tf.float32)
+  >>> y = tf.constant(3.0, dtype=tf.float32)
+  >>> with tf.GradientTape(persistent=True) as tape:
+  ...   tape.watch(x)
+  ...   tape.watch(y)
+  ...   z = bar(x, y)
+  >>> z
+  <tf.Tensor: shape=(), dtype=float32, numpy=6.0>
+  >>> tape.gradient(z, x)
+  <tf.Tensor: shape=(), dtype=float32, numpy=3.0>
+  >>> tape.gradient(z, y)
+  <tf.Tensor: shape=(), dtype=float32, numpy=2.0>
 
   Nesting custom gradients can lead to unintuitive results. The default
   behavior does not correspond to n-th order derivatives. For example

@@ -43,7 +43,7 @@ class HloToIrBindings {
         b_(b),
         module_(llvm_module) {}
 
-  Status EmitBasePointersForHlos(
+  void EmitBasePointersForHlos(
       absl::Span<const HloInstruction* const> io_hlos,
       absl::Span<const HloInstruction* const> non_io_hlos);
 
@@ -115,6 +115,10 @@ class HloToIrBindings {
   // The address of the memory block that contains all temporary buffers.
   llvm::Value* temp_buffer_base_ = nullptr;
 };
+
+// Converts `ir_value` with type i8* to a typed LLVM Value* based on `shape`.
+llvm::Value* CastToTypedValue(const Shape& shape, llvm::Value* ir_value,
+                              llvm::IRBuilder<>* b);
 
 }  // namespace gpu
 }  // namespace xla

@@ -6,6 +6,12 @@ package(
     licenses = ["notice"],  # Apache 2.0
 )
 
+filegroup(
+    name = "all_py_srcs",
+    srcs = glob(["*.py"]),
+    visibility = ["//tensorflow/python/keras/google/private_tf_api_test:__pkg__"],
+)
+
 py_library(
     name = "rnn_cell_impl",
     srcs = ["rnn_cell_impl.py"],
@@ -31,6 +37,7 @@ py_library(
         "//tensorflow/python/keras:activations",
         "//tensorflow/python/keras:initializers",
         "//tensorflow/python/keras/engine:input_spec",
+        "//tensorflow/python/keras/legacy_tf_layers:layers_base",
         "//tensorflow/python/keras/utils:tf_utils",
         "//tensorflow/python/training/tracking:base",
     ],

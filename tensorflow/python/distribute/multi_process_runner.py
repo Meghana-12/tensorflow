@@ -19,6 +19,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import atexit
 import collections
 import contextlib
 import json
@@ -28,6 +29,7 @@ import sys
 import threading
 import time
 import unittest
+import weakref
 
 from absl import logging
 import six
@@ -67,7 +69,8 @@ except ImportError:
 # exception stack trace info is stored in exc_info to pass on to parent process
 # to be re-raised.
 _ProcessStatusInfo = collections.namedtuple(
-    '_ProcessStatusInfo', ['is_successful', 'exc_info', 'return_value'])
+    '_ProcessStatusInfo',
+    ['task_type', 'task_id', 'is_successful', 'exc_info', 'return_value'])
 
 # Information returned from a successful MultiProcessRunner run.
 MultiProcessRunnerResult = collections.namedtuple('MultiProcessRunnerResult',
@@ -97,6 +100,11 @@ Resources = collections.namedtuple('Resources', [
 # "medium" timeout of the test runs.
 _DEFAULT_TIMEOUT_SEC = 200
 
+# The timeout in seconds to wait to force kill a child process. When a child
+# process times out we first try to SIGTERM it so that it has a chance to dump
+# stacktraces. However dumping stacktrace can take a long time.
+_FORCE_KILL_WAIT_SEC = 30
+
 
 class MultiProcessRunner(object):
   """A utility class to start multiple processes to simulate a cluster.
@@ -115,21 +123,23 @@ class MultiProcessRunner(object):
   """
 
   def __init__(self,
-               proc_func,
+               fn,
                cluster_spec,
                rpc_layer=None,
                max_run_time=None,
                grpc_fail_fast=None,
-               stream_stdout=True,
-               list_stdout=False,
+               stream_output=True,
+               return_output=False,
                use_dill_for_args=True,
                daemon=False,
+               dependence_on_chief=True,
+               auto_restart=False,
                args=None,
                kwargs=None):
     """Creates a multi-process runner.
 
     Args:
-      proc_func: Function to be run on child processes. This will be run on
+      fn: Function to be run on child processes. This will be run on
         processes for all task types.
       cluster_spec: Dict for cluster spec. The following is an example of
         cluster with three workers and two ps's.
@@ -150,9 +160,9 @@ class MultiProcessRunner(object):
       grpc_fail_fast: Whether GRPC connection between processes should fail
         without retrying. Defaults to None, in which case the environment
         variable is not explicitly set.
-      stream_stdout: True if the output/error from the subprocesses should be
+      stream_output: True if the output/error from the subprocesses should be
         streamed to be printed in parent process' log. Defaults to True.
-      list_stdout: True if the output/error from the subprocesses should be
+      return_output: True if the output/error from the subprocesses should be
         collected to be attached to the resulting `MultiProcessRunnerResult`
         returned from `MultiProcessRunner.join()`. If True, the list of stdout
         can be retrieved via `MultiProcessRunnerResult.stdout` attribute.
@@ -161,6 +171,11 @@ class MultiProcessRunner(object):
         can pickle more objects, but doesn't work with types in
         `multiprocessing` library like `Mutex`.
       daemon: Whether to start processes as daemons.
+      dependence_on_chief: Whether to terminates the cluster if the chief exits.
+        If auto_restart is True, it only terminates the cluster if the chief
+        exits with a zero exit code.
+      auto_restart: Whether to automatically restart processes that exit with
+        non-zero exit code.
       args: Positional arguments to be sent to functions run on processes.
       kwargs: Keyword arguments to be sent to functions run on processes.
 
@@ -174,25 +189,27 @@ class MultiProcessRunner(object):
                        'one chief. Current `cluster_spec` has {} chiefs.'
                        .format(len(cluster_spec['chief'])))
     if not multi_process_lib.initialized():
-      raise RuntimeError('`multi_process_runner` is not initialized. '
-                         'Please call `multi_process_runner.test_main()` '
-                         'within `if __name__ == \'__main__\':` block '
-                         'in your python module to properly initialize '
-                         '`multi_process_runner`.')
-    if not callable(proc_func):
-      raise ValueError('proc_func is not a callable')
+      raise MultiProcessRunnerNotInitializedError(
+          '`multi_process_runner` is not initialized. '
+          'Please call `multi_process_runner.test_main()` '
+          'within `if __name__ == \'__main__\':` block '
+          'in your python module to properly initialize '
+          '`multi_process_runner`.')
+    if not callable(fn):
+      raise ValueError('fn is not a callable')
 
-    self._proc_func = proc_func
+    self._fn = fn
     self._cluster_spec = cluster_spec
     self._rpc_layer = rpc_layer or 'grpc'
     self._max_run_time = max_run_time
     self._grpc_fail_fast = grpc_fail_fast
-    self._stream_stdout = stream_stdout
-    # TODO(rchao): Revisit list_stdout argument to consider other solution.
-    self._list_stdout = list_stdout
-    self._dependence_on_chief = True
+    self._stream_output = stream_output
+    # TODO(rchao): Revisit return_output argument to consider other solution.
+    self._return_output = return_output
+    self._dependence_on_chief = dependence_on_chief
     self._use_dill_for_args = use_dill_for_args
     self._daemon = daemon
+    self._auto_restart = auto_restart
     self._args = args or ()
     self._kwargs = kwargs or {}
 
@@ -201,11 +218,18 @@ class MultiProcessRunner(object):
     self._executing_eagerly = context.executing_eagerly()
 
     self._joined = False
+    self._process_lock = threading.Lock()
+    # Guarded by self._process_lock.
     self._processes = {}
-    self._outstanding_subprocess_count = 0
+    # Record which processes are terminated. Due to a bug in Python<3.7,
+    # terminated processes return 255 exit code, which should cause an exception
+    # in join().
+    # https://bugs.python.org/issue30589
+    # Guarded by self._process_lock.
+    self._terminated = set()
     self._reading_threads = []
 
-    self._manager = multiprocessing.Manager()
+    self._manager = manager()
     self._process_status_queue = self._manager.Queue()
     self._parent_to_sub_queue = self._manager.Queue()
     parties = sum(len(addresses) for addresses in self._cluster_spec.values())
@@ -215,8 +239,7 @@ class MultiProcessRunner(object):
     # safe.
     self._streaming_queue = self._manager.Queue()
 
-    # This flag will be set to True once terminate_all() is called.
-    self._all_forced_terminated = False
+    self._watchdog_thread = None
 
   def set_args(self, args=None, kwargs=None):
     self._args = args or self._args
@@ -228,18 +251,18 @@ class MultiProcessRunner(object):
       for line in reader:
         task_string = '[{}-{}]:'.format(task_type, task_id)
         formatted_line = '{} {}'.format(task_string.ljust(14), line)
-        if self._stream_stdout:
+        if self._stream_output:
           # TODO(rchao): Use a lock here to ensure the printed lines are not
           # broken.
           print(formatted_line, end='', flush=True)
-        if self._list_stdout:
+        if self._return_output:
           self._streaming_queue.put(formatted_line)
 
   def _start_subprocess_and_reading_thread(self,
                                            task_type,
                                            task_id,
                                            cluster_spec=None,
-                                           proc_func=None,
+                                           fn=None,
                                            args=None,
                                            kwargs=None):
     """Start a subprocess and a thread the reads lines from the subprocess."""
@@ -264,11 +287,11 @@ class MultiProcessRunner(object):
         streaming_pipe_w=pipe_w,
         barrier=self._barrier,
     )
-    if proc_func is None:
-      proc_func, args, kwargs = self._proc_func, self._args, self._kwargs
-    # Always use dill to pickle proc_func so that we support more callable
+    if fn is None:
+      fn, args, kwargs = self._fn, self._args, self._kwargs
+    # Always use dill to pickle fn so that we support more callable
     # types, e.g. lambda.
-    proc_func = dill.dumps(proc_func, dill.HIGHEST_PROTOCOL)
+    fn = dill.dumps(fn, dill.HIGHEST_PROTOCOL)
     if self._use_dill_for_args:
       args = dill.dumps(args, dill.HIGHEST_PROTOCOL)
       kwargs = dill.dumps(kwargs, dill.HIGHEST_PROTOCOL)
@@ -276,12 +299,11 @@ class MultiProcessRunner(object):
     p = _Process(
         test_env=test_env,
         target=_ProcFunc(),
-        args=(resources, test_env, proc_func, args, kwargs,
-              self._use_dill_for_args),
+        args=(resources, test_env, fn, args, kwargs, self._use_dill_for_args),
         daemon=self._daemon)
     p.start()
     self._processes[(task_type, task_id)] = p
-    self._outstanding_subprocess_count += 1
+    self._terminated.discard((task_type, task_id))
 
     # For each subprocess, we dedicate a thread continuously reading lines
     # from them.
@@ -291,17 +313,26 @@ class MultiProcessRunner(object):
     thread.start()
     self._reading_threads.append(thread)
 
+    if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+      self._watchdog_thread = threading.Thread(target=self._process_watchdog)
+      self._watchdog_thread.start()
+
   def start(self):
     """Starts processes, one for each task in `cluster_spec`.
 
     Note that this is best effort by the applicable multiprocessing library,
     and it may take up to seconds for a subprocess to be successfully started.
     """
-    if self._processes:
-      raise ValueError('MultiProcessRunner already started.')
-    for task_type, addresses in self._cluster_spec.items():
-      for task_id, _ in enumerate(addresses):
-        self._start_subprocess_and_reading_thread(task_type, task_id)
+    with self._process_lock:
+      if self._processes:
+        raise ValueError('MultiProcessRunner already started.')
+      if self._joined:
+        raise ValueError('cannot start new processes after'
+                         'MultiProcessRunner.join() is called')
+
+      for task_type, addresses in self._cluster_spec.items():
+        for task_id, _ in enumerate(addresses):
+          self._start_subprocess_and_reading_thread(task_type, task_id)
 
     # TODO(rchao): Remove the need of using SIGALRM if possible. At this time,
     # without this the tests become very flaky.
@@ -325,7 +356,7 @@ class MultiProcessRunner(object):
     called:
 
     ```python
-    def proc_func():
+    def fn():
       # user code to be run
       import pdb; pdb.set_trace()
 
@@ -336,7 +367,7 @@ class MultiProcessRunner(object):
           task_id=0)
 
     mpr = multi_process_runner.MultiProcessRunner(
-        proc_func,
+        fn,
         multi_worker_test_base.create_cluster_spec(
             has_chief=True, num_workers=1))
     threading.Thread(target=follow_ups).start()
@@ -344,7 +375,7 @@ class MultiProcessRunner(object):
     mpr.join()
     ```
 
-    Note that if `list_stdout=True`, the logs/stdout by task
+    Note that if `return_output=True`, the logs/stdout by task
     run by the main process is not available in result.stdout.
 
     Args:
@@ -353,26 +384,30 @@ class MultiProcessRunner(object):
     """
     if self._processes:
       raise ValueError('MultiProcessRunner already started.')
-    for task_type, addresses in self._cluster_spec.items():
-      for task_id, _ in enumerate(addresses):
-        if not (task_type == as_task_type and task_id == as_task_id):
-          self._start_subprocess_and_reading_thread(task_type, task_id)
+    with self._process_lock:
+      if self._joined:
+        raise ValueError('cannot start new processes after'
+                         'MultiProcessRunner.join() is called')
+      for task_type, addresses in self._cluster_spec.items():
+        for task_id, _ in enumerate(addresses):
+          if not (task_type == as_task_type and task_id == as_task_id):
+            self._start_subprocess_and_reading_thread(task_type, task_id)
 
     _set_tf_config(as_task_type, as_task_id, self._cluster_spec,
                    self._rpc_layer)
-    self._proc_func(*self._args, **self._kwargs)
+    self._fn(*self._args, **self._kwargs)
 
   def start_single_process(self,
                            task_type,
                            task_id,
                            cluster_spec=None,
-                           proc_func=None,
+                           fn=None,
                            args=None,
                            kwargs=None):
     """Starts a single process.
 
     This starts a process in the cluster with the task type, task id, and the
-    process function (`proc_func`). If process function is `None`, the function
+    process function (`fn`). If process function is `None`, the function
     provided at `__init__` will be used. If `cluster_spec` is `None`, the
     cluster spec provided at `__init__` will be used.
 
@@ -386,19 +421,23 @@ class MultiProcessRunner(object):
       cluster_spec: The cluster spec to be used on the newly started
         process. If `None`, the cluster spec provided at `__init__` will be
         used.
-      proc_func: The process function to be run on the newly started
+      fn: The process function to be run on the newly started
         process. If specified, specify `args` and `kwargs` as well. If `None`,
         the function provided at `__init__` will be used.
-      args: Optional positional arguments to be supplied in `proc_func`.
-      kwargs: Optional keyword arguments to be supplied in `proc_func`.
+      args: Optional positional arguments to be supplied in `fn`.
+      kwargs: Optional keyword arguments to be supplied in `fn`.
     """
-    self._start_subprocess_and_reading_thread(
-        task_type,
-        task_id,
-        cluster_spec=cluster_spec,
-        proc_func=proc_func,
-        args=args or (),
-        kwargs=kwargs or {})
+    with self._process_lock:
+      if self._joined:
+        raise ValueError('cannot start new processes after'
+                         'MultiProcessRunner.join() is called')
+      self._start_subprocess_and_reading_thread(
+          task_type,
+          task_id,
+          cluster_spec=cluster_spec,
+          fn=fn,
+          args=args or (),
+          kwargs=kwargs or {})
 
   def _queue_to_list(self, queue_to_convert):
     """Convert `queue.Queue` to `list`."""
@@ -411,9 +450,17 @@ class MultiProcessRunner(object):
         break
     return list_to_return
 
+  def _get_process_statuses(self):
+    # One worker may have multiple statuses. We only keep the last one.
+    statuses = {}
+    for status in self._queue_to_list(self._process_status_queue):
+      statuses[(status.task_type, status.task_id)] = status
+    return statuses
+
   def get_process_id(self, task_type, task_id):
     """Returns the subprocess id given the task type and task id."""
-    p = self._processes.get((task_type, task_id), None)
+    with self._process_lock:
+      p = self._processes.get((task_type, task_id), None)
     return p.pid if p else None
 
   def get_process_exit_code(self, task_type, task_id):
@@ -430,22 +477,75 @@ class MultiProcessRunner(object):
       KeyError: If the corresponding subprocess is not found with `task_type`
         and `task_id`.
     """
-    p = self._processes[(task_type, task_id)]
+    with self._process_lock:
+      p = self._processes[(task_type, task_id)]
     return p.exitcode if p else None
 
-  def _join_or_terminate(self, task_type, task_id, process, timeout):
-    """Joins a process. If it times out, terminate all procsses."""
-    logging.info('joining %s-%d', task_type, task_id)
-    process.join(timeout)
-    # If exitcode is None, the process aren't terminated and this is a
-    # timeout.
-    if process.exitcode is None:
-      # Force termination to dump worker processes stack trace.
-      self.terminate_all(sig=signal.SIGTERM)
-      process_statuses = self._queue_to_list(self._process_status_queue)
-      raise SubprocessTimeoutError(
-          '%s-%d and possibly more subprocesses timed out.' %
-          (task_type, task_id), self._get_mpr_result(process_statuses))
+  def process_exists(self, task_type, task_id):
+    """Returns whether the subprocess still exists given the task type and id.
+
+    Args:
+      task_type: The task type.
+      task_id: The task id.
+
+    Returns:
+      Boolean; whether the subprocess still exists. If the subprocess has
+      exited, this returns False.
+    """
+    return self.get_process_exit_code(task_type, task_id) is None
+
+  def _process_watchdog(self):
+    """Simulates a cluster management system.
+
+    - If auto_restart is True, it restarts processes that exit with a non-zero
+      exit code. Note that when join() times out it overrides auto_restart to
+      False.
+    - If dependence_on_chief is True, it terminates all processes once the chief
+      exits. If auto_restart is also True, it only terminates all processes if
+      the chief exit with a zero exit code, otherwise it restarts the chief.
+
+    This runs in self._watchdog_thread.
+    """
+    while True:
+      time.sleep(1)
+      with self._process_lock:
+        chief = self._processes.get(('chief', 0), None)
+        # Terminate the cluster when _dependence_on_chief is True if either:
+        # - chief has exited with zero exit code.
+        # - chief has exited with non-zero exit code and self._auto_restart is
+        #   False.
+        if chief and self._dependence_on_chief and chief.exitcode is not None:
+          if chief.exitcode == 0 or (not self._auto_restart):
+            for p in self._processes.values():
+              # Give other processes a chance to exit on their own.
+              p.join(timeout=3)
+            self._terminate_all()
+            for p in self._processes.values():
+              p.join()
+            return
+
+        # Auto restart failed processes if self._auto_restart is True.
+        if self._auto_restart:
+          has_failure = False
+          for (task_type, task_id), p in self._processes.items():
+            if p.exitcode is not None and p.exitcode != 0:
+              has_failure = True
+              logging.info('Restarting failed %s-%d', task_type, task_id)
+              self._start_subprocess_and_reading_thread(task_type, task_id)
+          if has_failure:
+            continue
+
+        # Exit the thread if all processes have exited at this point.
+        if all(p.exitcode is not None for p in self._processes.values()):
+          return
+
+  def _reraise_if_subprocess_error(self, process_statuses):
+    for process_status in process_statuses.values():
+      assert isinstance(process_status, _ProcessStatusInfo)
+      if not process_status.is_successful:
+        process_status.exc_info[1].mpr_result = self._get_mpr_result(
+            process_statuses)
+        six.reraise(*process_status.exc_info)
 
   def join(self, timeout=_DEFAULT_TIMEOUT_SEC):
     """Joins all the processes with timeout.
@@ -463,13 +563,15 @@ class MultiProcessRunner(object):
     race is removed.
 
     Args:
-      timeout: if set and not all processes report status within roughly
-        `timeout` seconds, a `SubprocessTimeoutError` exception will be raised.
+      timeout: optional integer or `None`. If provided as an integer, and not
+      all processes report status within roughly `timeout` seconds, a
+      `SubprocessTimeoutError` exception will be raised. If `None`, `join` never
+      times out.
 
     Returns:
       A MultiProcessRunnerResult object, which has two attributes,
       `return_value` and `stdout`. `return_value` always contains the return
-      values from the subprocesses. If `list_stdout` argument is True at
+      values from the subprocesses. If `return_output` argument is True at
       `__init__`, `stdout` is available that contains a list of all messages
       from subprocesses' stdout and stderr.
 
@@ -487,43 +589,57 @@ class MultiProcessRunner(object):
         is not `None`, it is expected that some subprocesses may be
         force-killed when `max_run_time` is up, and this is raised in those
         cases.
-      Exception: if there is an Exception propagated from any subprocess.
+      Exception: if there is an Exception propagated from any subprocess. When
+        this is raised, a `MultiProcessRunnerResult` object can be retrieved by
+        `UnexpectedSubprocessExitError`'s mpr_result attribute, which has the
+        same structure as above 'Returns' section describes.
     """
-    if self._joined:
-      raise ValueError("MultiProcessRunner can't be joined twice.")
-    self._joined = True
+    if timeout and not isinstance(timeout, int):
+      raise ValueError('`timeout` must be an integer or `None`.')
+    with self._process_lock:
+      if self._joined:
+        raise ValueError("MultiProcessRunner can't be joined twice.")
+      self._joined = True
 
-    chief = self._processes.get(('chief', 0), None)
-    if self._dependence_on_chief and chief:
-      self._join_or_terminate('chief', 0, chief, timeout)
-      # Give other processes a chance to exit on their own.
-      for p in self._processes.values():
-        p.join(timeout=3)
-      self.terminate_all()
-    else:
-      for (task_type, task_id), p in self._processes.items():
-        self._join_or_terminate(task_type, task_id, p, timeout)
+    self._watchdog_thread.join(timeout)
+    if self._watchdog_thread.is_alive():
+      # Timeout. Force termination to dump worker processes stack trace.
+      with self._process_lock:
+        self._auto_restart = False
+      logging.error('Timeout when joining for child processes. Terminating...')
+      self.terminate_all(sig=signal.SIGTERM)
+      # Wait for the processes to terminate by themselves first, so they have a
+      # chance to dump stacktraces. After _FORCE_KILL_WAIT_SEC, we SIGKILL them.
+      self._watchdog_thread.join(_FORCE_KILL_WAIT_SEC)
+      if self._watchdog_thread.is_alive():
+        logging.error('Timeout when waiting for child processes to '
+                      'print stacktrace. Sending SIGKILL...')
+        self.terminate_all()
+        self._watchdog_thread.join()
+      process_statuses = self._get_process_statuses()
+      self._reraise_if_subprocess_error(process_statuses)
+      raise SubprocessTimeoutError(
+          'One or more subprocesses timed out, where timeout was set to {}s. '
+          'Please change the `timeout` argument for '
+          '`MultiProcessRunner.join()` or `multi_process_runner.run()` '
+          'if it should be adjusted.'.format(timeout),
+          self._get_mpr_result(process_statuses))
 
     for (task_type, task_id), p in self._processes.items():
       logging.info('%s-%d exit code: %s', task_type, task_id, p.exitcode)
 
-    process_statuses = self._queue_to_list(self._process_status_queue)
-    for process_status in process_statuses:
-      assert isinstance(process_status, _ProcessStatusInfo)
-      if not process_status.is_successful:
-        six.reraise(*process_status.exc_info)
+    process_statuses = self._get_process_statuses()
+    self._reraise_if_subprocess_error(process_statuses)
 
     # Checking all the processes that are expected to exit properly.
     for (task_type, task_id), p in self._processes.items():
-      if self._dependence_on_chief and chief and task_type != 'chief':
-        # If _dependence_on_chief, other processes may have been
-        # forced-terminated, which is expected.
-        continue
-      # Successfully exiting process has exit code 0.
-      if p.exitcode is None or p.exitcode > 0:
+      # Successfully exiting process has exit code 0. We ignore processes that
+      # are terminated.
+      assert p.exitcode is not None
+      if (p.exitcode > 0 and (task_type, task_id) not in self._terminated):
         raise UnexpectedSubprocessExitError(
-            'Subprocess %s-%d exited with exit code %d. See logs for details.' %
-            (task_type, task_id, p.exitcode),
+            'Subprocess %s-%d exited with exit code %s. See logs for details.'
+            % (task_type, task_id, p.exitcode),
             self._get_mpr_result(process_statuses))
 
     logging.info('Joining log reading threads.')
@@ -539,57 +655,60 @@ class MultiProcessRunner(object):
   def _get_mpr_result(self, process_statuses):
     stdout = self._queue_to_list(self._streaming_queue)
     return_values = []
-    for process_status in process_statuses:
+    for process_status in process_statuses.values():
       if process_status.return_value is not None:
         return_values.append(process_status.return_value)
     return MultiProcessRunnerResult(stdout=stdout, return_value=return_values)
 
   def terminate(self, task_type, task_id):
-    """Terminates the process with `task_type` and `task_id`."""
-    p = self._processes.get((task_type, task_id), None)
-    if p is None:
-      raise ValueError('{}-{} does not exist'.format(task_type, task_id))
-    # TODO(crccw): change to use Process.terminate() as well.
-    self._parent_to_sub_queue.put('terminate {} {}'.format(task_type, task_id))
-    p.join()
+    """Terminates the process with `task_type` and `task_id`.
 
-  def terminate_all(self, sig=None):
-    """Terminates all subprocesses."""
+    If auto_retart=True, the terminated task will be restarted unless the chief
+    has already exited with zero exit code.
+
+    Args:
+      task_type: the task type.
+      task_id: the task id.
+
+    """
+    with self._process_lock:
+      p = self._processes.get((task_type, task_id), None)
+      if p is None:
+        raise ValueError('{}-{} does not exist'.format(task_type, task_id))
+      self._terminated.add((task_type, task_id))
+      # TODO(crccw): change to use Process.terminate() as well.
+      self._parent_to_sub_queue.put('terminate {} {}'.format(
+          task_type, task_id))
+      p.join()
+
+  def _terminate_all(self, sig=None):
+    """Terminates all subprocesses.
+
+    The caller is required to hold self._process_lock.
+
+    Args:
+      sig: the signal used to terminate the process. The default is SIGKILL.
+    """
+
     # Use SIGKILL as default. In systems where that's unavailable such as
     # windows, use SIGTERM.
     sig = sig or getattr(signal, 'SIGKILL', signal.SIGTERM)
     for (task_type, task_id), p in self._processes.items():
+      if p.exitcode is not None:
+        continue
       try:
         os.kill(p.pid, sig)
+        self._terminated.add((task_type, task_id))
         logging.info('%s-%d terminated with signal %r.', task_type, task_id,
                      sig)
       except ProcessLookupError:
         logging.info('Attempting to kill %s-%d but it does not exist.',
                      task_type, task_id)
-    self._all_forced_terminated = True
 
-  def get_manager(self):
-    """Returns the multiprocessing manager object for concurrency tools.
-
-    The manager object is useful as it controls a server process that holds
-    the python objects that can be shared across processes. This can be used
-    for parent-subprocess communication:
-
-    ```python
-    mpr = multi_process_runner.MultiProcessRunner(...)
-    manager = mpr.get_manager()
-    some_event_happening_in_subprocess = manager.Event()
-    mpr.set_args(args=(some_event_happening_in_subprocess,))
-    mpr.start()
-    some_event_happening_in_subprocess.wait()
-    # Do something that only should after some event happens in subprocess.
-    ```
-
-    Note that the user of multi_process_runner should not create additional
-    `multiprocessing.Manager()` objects; doing so can result in segfault in
-    some cases.
-    """
-    return self._manager
+  def terminate_all(self, sig=None):
+    """Terminates all subprocesses."""
+    with self._process_lock:
+      self._terminate_all(sig)
 
 
 class _Process(multi_process_lib.Process):
@@ -648,11 +767,13 @@ class _ProcFunc(object):
         time.sleep(0.1)
     self._resources.process_status_queue.put(
         _ProcessStatusInfo(
+            task_type=task_type,
+            task_id=task_id,
             is_successful=True,
             exc_info=None,
             return_value=None))
-    # `os._exit(0)` is used to more reliably terminate a subprocess.
-    os._exit(0)  # pylint: disable=protected-access
+    # `os._exit(1)` is used to more reliably terminate a subprocess.
+    os._exit(1)  # pylint: disable=protected-access
 
   def _close_streaming(self):
     """Close stdout, stderr and streaming pipe.
@@ -666,15 +787,14 @@ class _ProcFunc(object):
     sys.stderr.close()
     self._resources.streaming_pipe_w.close()
 
-  def __call__(self, resources, test_env, proc_func, args, kwargs,
-               use_dill_for_args):
+  def __call__(self, resources, test_env, fn, args, kwargs, use_dill_for_args):
     """The wrapper function that actually gets run in child process(es)."""
 
     global _barrier
 
     self._resources = resources
     _barrier = self._resources.barrier
-    proc_func = dill.loads(proc_func)
+    fn = dill.loads(fn)
     if use_dill_for_args:
       args = dill.loads(args)
       kwargs = dill.loads(kwargs)
@@ -708,7 +828,8 @@ class _ProcFunc(object):
       v2_compat.enable_v2_behavior()
 
     with self._runtime_mode(test_env.executing_eagerly):
-      info = _run_contained(proc_func, args, kwargs)
+      info = _run_contained(test_env.task_type, test_env.task_id, fn, args,
+                            kwargs)
       self._resources.process_status_queue.put(info)
 
       # Re-raise the exception in addition to reporting it to the parent
@@ -725,6 +846,20 @@ class _ProcFunc(object):
 
     # Exit with code 0 as it's considered successful exit at this point.
     sys.exit(0)
+
+
+# Active MultiProcessPoolRunner. We need to shut them down when the program
+# exits. For the main process, we do this via atexit callback. For a process
+# that is spawned by MultiProcessPoolRunner, e.g. nested MultiProcessPoolRunner,
+# we do this manually at the end of _pool_runner_worker. The reason is that
+# multiprocessing library waits for all spawned processes to exit, so atexit
+# callbacks won't trigger until all pools are shutdown.
+_active_pool_runners = weakref.WeakSet()
+
+
+def _shutdown_all_pool_runners():
+  for pool in _active_pool_runners:
+    pool.shutdown()
 
 
 class MultiProcessPoolRunner(object):
@@ -749,6 +884,7 @@ class MultiProcessPoolRunner(object):
       RuntimeError: if `multi_process_runner.test_main()` is not called.
       ValueError: if there are more than one chief in the `cluster_spec`.
     """
+    _active_pool_runners.add(self)
     self._cluster_spec = cluster_spec
     self._initializer = initializer
     self._conn = {}
@@ -763,28 +899,27 @@ class MultiProcessPoolRunner(object):
       conn.close()
     self._conn = {}
     if self._runner is not None:
-      self._runner.join()
+      try:
+        self._runner.join()
+      except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            'Ignoring exception when shutting down MultiProcessPoolRunner: %s',
+            e)
       self._runner = None
 
   def _start(self):
     """Starts the worker pool."""
     # We need different arguments for different processes so we're passing a
-    # no-op proc_func here and use start_single_process instead.
-    #
-    # We also need to start the process pool as daemon, so that they don't block
-    # the program from exiting. Note that __del__ may not get called when
-    # there's an exception. The user may also store a pool runner in a global
-    # object to share across test cases
+    # no-op fn here and use start_single_process instead.
 
     if dill is None:
       raise unittest.SkipTest(
           'TODO(b/150264776): Resolve dependency issue in CI')
 
     self._runner = MultiProcessRunner(
-        proc_func=lambda: None,
+        fn=lambda: None,
         cluster_spec=self._cluster_spec,
-        use_dill_for_args=False,
-        daemon=True)
+        use_dill_for_args=False)
     if self._initializer:
       initializer = dill.dumps(self._initializer, dill.HIGHEST_PROTOCOL)
     else:
@@ -796,16 +931,20 @@ class MultiProcessPoolRunner(object):
         self._runner.start_single_process(
             task_type,
             task_id,
-            proc_func=_pool_runner_worker,
-            args=(initializer, conn2))
+            fn=_pool_runner_worker,
+            args=(task_type, task_id, initializer, conn2))
+    # In the case MultiProcessPoolRunner is not GC-ed, we register an atexit
+    # callback to shut them down. For example, when there're global
+    # MultiProcessPoolRunner.
+    atexit.register(_shutdown_all_pool_runners)
 
-  def run(self, proc_func, args=None, kwargs=None):
-    """Runs `proc_func` with `args` and `kwargs` on all jobs.
+  def run(self, fn, args=None, kwargs=None):
+    """Runs `fn` with `args` and `kwargs` on all jobs.
 
     Args:
-      proc_func: The function to be run.
-      args: Optional positional arguments to be supplied in `proc_func`.
-      kwargs: Optional keyword arguments to be supplied in `proc_func`.
+      fn: The function to be run.
+      args: Optional positional arguments to be supplied in `fn`.
+      kwargs: Optional keyword arguments to be supplied in `fn`.
 
     Returns:
       A list of return values.
@@ -815,9 +954,9 @@ class MultiProcessPoolRunner(object):
     if self._runner is None:
       self._start()
 
-    proc_func = dill.dumps(proc_func, dill.HIGHEST_PROTOCOL)
+    fn = dill.dumps(fn, dill.HIGHEST_PROTOCOL)
     for conn in self._conn.values():
-      conn.send((proc_func, args or [], kwargs or {}))
+      conn.send((fn, args or [], kwargs or {}))
 
     process_statuses = []
     for (task_type, task_id), conn in self._conn.items():
@@ -825,7 +964,7 @@ class MultiProcessPoolRunner(object):
       try:
         process_statuses.append(conn.recv())
       except EOFError:
-        # This shouldn't happen due to exceptions in proc_func. This usually
+        # This shouldn't happen due to exceptions in fn. This usually
         # means bugs in the runner.
         self.shutdown()
         raise RuntimeError('Unexpected EOF. Worker process may have died. '
@@ -842,7 +981,7 @@ class MultiProcessPoolRunner(object):
     return return_values
 
 
-def _pool_runner_worker(initializer, conn):
+def _pool_runner_worker(task_type, task_id, initializer, conn):
   """Function that runs on the workers in a pool.
 
   It listens for callables to run and returns the result until `conn` is closed.
@@ -850,8 +989,10 @@ def _pool_runner_worker(initializer, conn):
   `conn`.
 
   Args:
-    initializer: A callable to execute during startup.
-    conn: A multiprocessing.Connection object to listen for tasks and send
+    task_type: the task type.
+    task_id: the task index.
+    initializer: a callable to execute during startup.
+    conn: a multiprocessing.Connection object to listen for tasks and send
       results.
   """
   if initializer:
@@ -859,26 +1000,34 @@ def _pool_runner_worker(initializer, conn):
     initializer()
   while True:
     try:
-      proc_func, args, kwargs = conn.recv()
+      fn, args, kwargs = conn.recv()
     except EOFError:
       break
-    proc_func = dill.loads(proc_func)
-    info = _run_contained(proc_func, args, kwargs)
+    fn = dill.loads(fn)
+    info = _run_contained(task_type, task_id, fn, args, kwargs)
     sys.stdout.flush()
     sys.stderr.flush()
     conn.send(info)
+  # Shutdown all MultiProcessPoolRunner in this process manually.
+  # MultiProcessPoolRunner registers an atexit callback to shutdown all pool
+  # runners, but we cannot rely on that in processes spawned by the
+  # multiprocessing library. This is because the library waits for all
+  # subprocesses before exiting and thus all atexit callbacks.
+  _shutdown_all_pool_runners()
 
 
-def _run_contained(proc_func, args, kwargs):
-  """Runs `proc_func` with `args` and `kwargs`.
+def _run_contained(task_type, task_id, fn, args, kwargs):
+  """Runs `fn` with `args` and `kwargs`.
 
   The function returns _ProcessStatusInfo which captures the return value and
   the exception.
 
   Args:
-    proc_func: The function to be run.
-    args: Optional positional arguments to be supplied in `proc_func`.
-    kwargs: Optional keyword arguments to be supplied in `proc_func`.
+    task_type: the task type.
+    task_id: the task index.
+    fn: the function to be run.
+    args: optional positional arguments to be supplied in `fn`.
+    kwargs: optional keyword arguments to be supplied in `fn`.
 
   Returns:
     a _ProcessStatusInfo.
@@ -888,18 +1037,22 @@ def _run_contained(proc_func, args, kwargs):
   return_value = None
   exc_info = None
   try:
-    return_value = proc_func(*args, **kwargs)
+    return_value = fn(*args, **kwargs)
     is_successful = True
     return _ProcessStatusInfo(
+        task_type=task_type,
+        task_id=task_id,
         is_successful=is_successful,
         exc_info=exc_info,
         return_value=return_value)
 
-  # If `proc_func` ends up exiting with `sys.exit()`, the `SystemExit` is not
+  # If `fn` ends up exiting with `sys.exit()`, the `SystemExit` is not
   # handled here.
   except Exception:  # pylint: disable=broad-except
     exc_info = sys.exc_info()
     return _ProcessStatusInfo(
+        task_type=task_type,
+        task_id=task_id,
         is_successful=is_successful,
         exc_info=exc_info,
         return_value=return_value)
@@ -931,6 +1084,16 @@ class UnexpectedSubprocessExitError(RuntimeError):
     self.mpr_result = mpr_result
 
 
+class MultiProcessRunnerNotInitializedError(RuntimeError):
+  """An error indicating `MultiProcessRunner` is used without initialization.
+
+  When this is raised, user is supposed to call
+  `multi_process_runner.test_main()` within `if __name__ == '__main__':` block
+  to properly initialize `multi_process_runner`.
+  """
+  pass
+
+
 def _set_tf_config(task_type, task_id, cluster_spec, rpc_layer=None):
   """Set TF_CONFIG environment variable."""
   tf_config_dict = {
@@ -945,13 +1108,13 @@ def _set_tf_config(task_type, task_id, cluster_spec, rpc_layer=None):
   os.environ['TF_CONFIG'] = json.dumps(tf_config_dict)
 
 
-def run(proc_func,
+def run(fn,
         cluster_spec,
         rpc_layer=None,
         max_run_time=None,
         grpc_fail_fast=None,
-        stream_stdout=True,
-        list_stdout=False,
+        stream_output=True,
+        return_output=False,
         timeout=_DEFAULT_TIMEOUT_SEC,
         args=None,
         kwargs=None):  # pylint: disable=g-doc-args
@@ -965,13 +1128,13 @@ def run(proc_func,
     A MultiProcessRunnerResult object returned from `MultiProcessRunner.join()`.
   """
   runner = MultiProcessRunner(
-      proc_func,
+      fn,
       cluster_spec,
       rpc_layer,
       max_run_time=max_run_time,
       grpc_fail_fast=grpc_fail_fast,
-      stream_stdout=stream_stdout,
-      list_stdout=list_stdout,
+      stream_output=stream_output,
+      return_output=return_output,
       args=args,
       kwargs=kwargs)
   runner.start()
@@ -989,6 +1152,41 @@ def barrier():
         'in the main process. barrier() can only be called in the subprocesses.'
     )
   return _barrier
+
+
+_manager = None
+_manager_lock = threading.Lock()
+
+
+def manager():
+  """Returns the multiprocessing manager object for concurrency tools.
+
+  The manager object is useful as it controls a server process that holds
+  the python objects that can be shared across processes. This can be used
+  for parent-subprocess communication:
+
+  ```python
+  manager = multi_process_runner.manager()
+  some_event_happening_in_subprocess = manager.Event()
+  mpr = multi_process_runner.MultiProcessRunner(fn, cluster_spec,
+      args=(some_event_happening_in_subprocess,))
+  mpr.start()
+  some_event_happening_in_subprocess.wait()
+  # Do something that only should after some event happens in subprocess.
+  ```
+
+  Note that the user of multi_process_runner should not create additional
+  `multiprocessing.Manager()` objects; doing so can result in segfault in
+  some cases.
+
+  This method should only be called after multi_process_runner.test_main() is
+  called.
+  """
+  global _manager
+  with _manager_lock:
+    if _manager is None:
+      _manager = multiprocessing.Manager()
+    return _manager
 
 
 def test_main():

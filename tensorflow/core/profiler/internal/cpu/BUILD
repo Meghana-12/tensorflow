@@ -1,3 +1,4 @@
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 
 package(
@@ -29,7 +30,6 @@ cc_library(
     deps = [
         ":host_tracer_utils",
         "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/profiler:profiler_options_proto_cc",
         "//tensorflow/core/profiler/internal:profiler_factory",
@@ -62,7 +62,6 @@ tf_cc_test(
         "//tensorflow/core/profiler/utils:xplane_visitor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:optional",
-        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -73,7 +72,6 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/profiler:profiler_options_proto_cc",
         "//tensorflow/core/profiler/internal:profiler_factory",
@@ -91,7 +89,6 @@ cc_library(
         "//tensorflow/compiler/xla/service:hlo_proto_cc",
         "//tensorflow/compiler/xla/service/gpu:gpu_debug_info_manager",
         "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/profiler:profiler_options_proto_cc",
         "//tensorflow/core/profiler/internal:profiler_factory",

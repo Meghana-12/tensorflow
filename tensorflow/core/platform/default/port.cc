@@ -14,11 +14,11 @@ limitations under the License.
 ==============================================================================*/
 
 #include "absl/base/internal/sysinfo.h"
-
 #include "tensorflow/core/platform/cpu_info.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mem.h"
 #include "tensorflow/core/platform/numa.h"
+#include "tensorflow/core/platform/profile_utils/cpu_utils.h"
 #include "tensorflow/core/platform/snappy.h"
 #include "tensorflow/core/platform/types.h"
 
@@ -61,7 +61,13 @@ string Hostname() {
   return string(hostname);
 }
 
-string JobName() { return ""; }
+string JobName() {
+  const char* job_name_cs = std::getenv("TF_JOB_NAME");
+  if (job_name_cs != nullptr) {
+    return string(job_name_cs);
+  }
+  return "";
+}
 
 int NumSchedulableCPUs() {
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -347,7 +353,7 @@ bool Snappy_UncompressToIOVec(const char* compressed, size_t compressed_length,
 string Demangle(const char* mangled) { return mangled; }
 
 double NominalCPUFrequency() {
-  return absl::base_internal::NominalCPUFrequency();
+  return tensorflow::profile_utils::CpuUtils::GetCycleCounterFrequency();
 }
 
 MemoryInfo GetMemoryInfo() {

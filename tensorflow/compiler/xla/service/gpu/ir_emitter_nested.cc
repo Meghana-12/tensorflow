@@ -41,6 +41,16 @@ IrEmitterNested::IrEmitterNested(const HloModuleConfig& hlo_module_config,
     : IrEmitter(hlo_module_config, ir_emitter_context, /*is_nested=*/true),
       nested_computation_(nested_computation) {}
 
+StatusOr<std::unique_ptr<IrEmitterNested>> IrEmitterNested::Create(
+    const HloModuleConfig& hlo_module_config,
+    const HloComputation& nested_computation,
+    IrEmitterContext* ir_emitter_context) {
+  std::unique_ptr<IrEmitterNested> emitter(new IrEmitterNested(
+      hlo_module_config, nested_computation, ir_emitter_context));
+  TF_RETURN_IF_ERROR(emitter->EmitConstants(nested_computation, false));
+  return emitter;
+}
+
 // Nested function serves the same purpose on GPU as a thread-local function on
 // a CPU.
 Status IrEmitterNested::CodegenNestedComputation() {
@@ -104,7 +114,7 @@ Status IrEmitterNested::CodegenNestedComputation() {
       non_io_hlos.push_back(hlo);
     }
   }
-  TF_RETURN_IF_ERROR(bindings_.EmitBasePointersForHlos(io_hlos, non_io_hlos));
+  bindings_.EmitBasePointersForHlos(io_hlos, non_io_hlos);
 
   TF_RETURN_IF_ERROR(nested_computation_.root_instruction()->Accept(this));
   b_.SetInsertPoint(ret_instr);

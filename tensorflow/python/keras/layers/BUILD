@@ -16,7 +16,11 @@ package(
     licenses = ["notice"],  # Apache 2.0
 )
 
-exports_files(["LICENSE"])
+filegroup(
+    name = "all_py_srcs",
+    srcs = glob(["*.py"]),
+    visibility = ["//tensorflow/python/keras/google/private_tf_api_test:__pkg__"],
+)
 
 # A separate build for layers without serialization to avoid circular deps
 # with feature column.
@@ -39,6 +43,7 @@ py_library(
         ":kernelized",
         ":local",
         ":merge",
+        ":multi_head_attention",
         ":noise",
         ":normalization",
         ":normalization_v2",
@@ -47,7 +52,9 @@ py_library(
         ":recurrent_v2",
         ":rnn_cell_wrapper_v2",
         ":wrappers",
+        "//tensorflow/python/keras/feature_column",
         "//tensorflow/python/keras/layers/preprocessing",
+        "//tensorflow/python/keras/premade",
         "//tensorflow/python/keras/utils:tf_utils",
     ],
 )
@@ -194,6 +201,22 @@ py_library(
 py_library(
     name = "einsum_dense",
     srcs = ["einsum_dense.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//tensorflow/python:special_math_ops",
+        "//tensorflow/python:tensor_shape",
+        "//tensorflow/python:util",
+        "//tensorflow/python/keras:activations",
+        "//tensorflow/python/keras:base_layer",
+        "//tensorflow/python/keras:constraints",
+        "//tensorflow/python/keras:initializers",
+        "//tensorflow/python/keras:regularizers",
+    ],
+)
+
+py_library(
+    name = "multi_head_attention",
+    srcs = ["multi_head_attention.py"],
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/python:special_math_ops",
@@ -568,6 +591,7 @@ tf_py_test(
     srcs = ["subclassed_layers_test.py"],
     python_version = "PY3",
     shard_count = 3,
+    tfrt_enabled = True,
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/keras",
@@ -586,6 +610,18 @@ tf_py_test(
         "//tensorflow/python/keras",
         "//tensorflow/python/keras:combinations",
         "//third_party/py/numpy",
+        "@absl_py//absl/testing:parameterized",
+    ],
+)
+
+tf_py_test(
+    name = "multi_head_attention_test",
+    srcs = ["multi_head_attention_test.py"],
+    python_version = "PY3",
+    deps = [
+        ":multi_head_attention",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python/keras",
         "@absl_py//absl/testing:parameterized",
     ],
 )
@@ -653,7 +689,7 @@ tf_py_test(
 
 tf_py_test(
     name = "noise_test",
-    size = "small",
+    size = "medium",
     srcs = ["noise_test.py"],
     python_version = "PY3",
     deps = [
@@ -770,6 +806,7 @@ cuda_py_test(
     size = "medium",
     srcs = ["separable_convolutional_test.py"],
     python_version = "PY3",
+    tfrt_enabled = True,
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/keras",
@@ -784,7 +821,9 @@ cuda_py_test(
     srcs = ["lstm_v2_test.py"],
     python_version = "PY3",
     shard_count = 12,
-    tags = ["no_cuda11"],
+    tags = [
+        "no_oss",
+    ],
     xla_enable_strict_auto_jit = False,
     deps = [
         "//tensorflow/python:client_testlib",
@@ -800,7 +839,10 @@ cuda_py_test(
     srcs = ["gru_v2_test.py"],
     python_version = "PY3",
     shard_count = 12,
-    tags = ["no_cuda11"],
+    tags = [
+        "no_cuda11",
+        "no_oss",
+    ],
     xla_enable_strict_auto_jit = False,
     deps = [
         "//tensorflow/python:client_testlib",
@@ -816,6 +858,7 @@ tf_py_test(
     size = "small",
     srcs = ["serialization_test.py"],
     python_version = "PY3",
+    tfrt_enabled = True,
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/keras",
@@ -882,10 +925,12 @@ tf_py_test(
     tags = [
         "notsan",
     ],
+    tfrt_enabled = True,
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/keras",
         "//tensorflow/python/keras:combinations",
+        "//tensorflow/python/keras/legacy_tf_layers:layers_base",
         "//third_party/py/numpy",
         "@absl_py//absl/testing:parameterized",
     ],
@@ -896,6 +941,7 @@ tf_py_test(
     size = "small",
     srcs = ["layers_test.py"],
     python_version = "PY3",
+    tfrt_enabled = True,
     deps = [
         ":layers",
         "//tensorflow/python:client_testlib",
